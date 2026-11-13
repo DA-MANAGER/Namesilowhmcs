@@ -173,9 +173,9 @@ function namesilo_transactionCall($callType, $call, $params)
 
             case "getForwardingInfo":
                 if ($code == 300) {
-                    $response['traffic_type'] = $xml->reply->traffic_type;
-                    $response['forward_url']  = $xml->reply->forward_url;
-                    $response['forward_type'] = $xml->reply->forward_type;
+                    $response['traffic_type'] = (string)$xml->reply->traffic_type;
+                    $response['forward_url']  = (string)$xml->reply->forward_url;
+                    $response['forward_type'] = (string)$xml->reply->forward_type;
                 } else {
                     $response['error'] = $detail;
                 }
@@ -226,10 +226,11 @@ function namesilo_transactionCall($callType, $call, $params)
                         $hostname = rtrim($hostname, ".");
                         $response[] = array(
                             "hostname"  => $hostname,
-                            "type"      => $record->type,
-                            "address"   => $record->value,
-                            "record_id" => $record->record_id,
-                            "priority"  => $record->distance
+                            "type"      => (string)$record->type,
+                            "address"   => (string)$record->value,
+                            "record_id" => (string)$record->record_id,
+                            "priority"  => (string)$record->distance,
+                            "ttl"       => (string)$record->ttl,
                         );
                     }
                     break;
@@ -795,7 +796,7 @@ function namesilo_GetDNS($params)
     $result = namesilo_transactionCall("getForwardingInfo", $apiServerUrl . "/api/getDomainInfo?version=1&type=xml&key=$apiKey&domain=$sld.$tld", $params);
     if ($result['traffic_type'] == 'Forwarded') {
 
-        preg_match('/(https*)\:\/\/(.*)/is', $result['forward_url'], $m);
+        preg_match('/(https?)\:\/\/(.*)/is', $result['forward_url'], $m);
         if (@$m[1] && @$m[2]) {
 
             $forward_host = $m[1];
@@ -814,7 +815,6 @@ function namesilo_GetDNS($params)
 /*****************************************/
 function namesilo_SaveDNS($params)
 {
-
     # Set Appropriate API Server
     $apiServerUrl = ($params['Test_Mode'] == 'on') ? TEST_API_SERVER : LIVE_API_SERVER;
     # Set Appropriate API Key
@@ -822,84 +822,105 @@ function namesilo_SaveDNS($params)
     # Register Variables
     $tld = urlencode($params["tld"]);
     $sld = urlencode($params["sld"]);
-    # Retrieve Record IDs for existing records
-    $hostrecords = namesilo_transactionCall("listDNS", $apiServerUrl . "/api/dnsListRecords?version=1&type=xml&key=$apiKey&domain=$sld.$tld", $params);
-    foreach ($hostrecords as $host) {
-        $record_id = $host["record_id"];
-        # Remove existing records (except base domain)
-        namesilo_transactionCall("Standard", $apiServerUrl . "/api/dnsDeleteRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrid=$record_id", $params);
-    }
-    # First, check for forwarding
-    foreach (($params["dnsrecords"] ?? []) as $key => $values) {
 
-        if (($values['type'] == 'URL' || $values['type'] == 'FRAME') && ($values['hostname'] == 'http' || $values['hostname'] == 'https') && @$values['address']) {
-            $forward_used = 1;
-        }
-
-        if (($values['type'] == 'URL' || $values['type'] == 'FRAME') && $values['hostname'] != 'http' && $values['hostname'] != 'https') {
-
-            if (@$values['hostname']) {
-                $value_error_override = 'You must use either "http" or "https" in the Host Name field for Domain Forwarding.';
-            } else {
-                $value_error_override = 'A value for Host Name must be entered. Domain Forwarding has been disabled.';
+    # Fetch current live records from Namesilo, indexed by record_id
+    $existingRecords = namesilo_transactionCall("listDNS", $apiServerUrl . "/api/dnsListRecords?version=1&type=xml&key=$apiKey&domain=$sld.$tld", $params);
+    $existingById = [];
+    if (!isset($existingRecords['error'])) {
+        foreach ($existingRecords as $rec) {
+            if (!empty($rec['record_id'])) {
+                $existingById[$rec['record_id']] = $rec;
             }
-        } elseif (($values['type'] == 'URL' || $values['type'] == 'FRAME') && ($values['hostname'] == 'http' || $values['hostname'] == 'https') && !@$values['address']) {
+        }
+    }
 
+    # Check submitted records for forwarding directives
+    $forward_used = false;
+    $value_error_override = null;
+    foreach (($params["dnsrecords"] ?? []) as $values) {
+        if (($values['type'] == 'URL' || $values['type'] == 'FRAME') && ($values['hostname'] == 'http' || $values['hostname'] == 'https') && @$values['address']) {
+            $forward_used = true;
+        }
+        if (($values['type'] == 'URL' || $values['type'] == 'FRAME') && $values['hostname'] != 'http' && $values['hostname'] != 'https') {
+            $value_error_override = @$values['hostname']
+                ? 'You must use either "http" or "https" in the Host Name field for Domain Forwarding.'
+                : 'A value for Host Name must be entered. Domain Forwarding has been disabled.';
+        } elseif (($values['type'] == 'URL' || $values['type'] == 'FRAME') && ($values['hostname'] == 'http' || $values['hostname'] == 'https') && !@$values['address']) {
             $value_error_override = 'A value for Address must be entered. Domain Forwarding has been disabled.';
         }
     }
-    # If no forwarding used, set domain to custom DNS
-    if (!@$forward_used) {
+
+    # If no forwarding, ensure domain uses custom DNS
+    if (!$forward_used) {
         namesilo_transactionCall("Standard", $apiServerUrl . "/api/forceDomainTrafficType?version=1&type=xml&key=$apiKey&domain=$sld.$tld&traffic_type=3", $params);
     }
-    # Now, add each record
-    $api_dns_calls = array();
 
-    foreach (($params["dnsrecords"] ?? []) as $key => $values) {
+    # Process each submitted record: update existing ones, add new ones
+    $api_dns_calls = [];
+    $submittedIds  = [];
+    $result        = [];
+
+    foreach (($params["dnsrecords"] ?? []) as $values) {
         $hostname = urlencode(trim($values["hostname"]));
-        $type = $values["type"];
-        $address = urlencode(trim($values["address"]));
+        $type     = $values["type"];
+        $address  = urlencode(trim($values["address"]));
         $priority = urlencode(trim($values["priority"]));
+        $recordId = trim($values["record_id"] ?? '');
+        $ttl      = !empty($values["ttl"]) ? (int)$values["ttl"] : 7207;
 
-        # Check for forwarding and handle differently if it is a forward
+        # Handle domain forwarding records separately
         if (($values['type'] == 'URL' || $values['type'] == 'FRAME') && ($values['hostname'] == 'http' || $values['hostname'] == 'https') && @$values['address']) {
-
             $forward_method = ($values['type'] == 'URL' ? '301' : 'cloaked');
             $apicall = "/api/domainForward?version=1&type=xml&key=$apiKey&domain=$sld.$tld&protocol={$hostname}&address={$address}&method=$forward_method";
         } else {
-            # Check to make sure there is something to add
-            //if (empty($hostname) || empty($address)) { continue; }
-            if (empty($address)) {
-                continue;
-            }
-            if ($type == 'MX' && empty($priority)) {
-                continue;
-            }
+            if (empty($address)) continue;
+            if ($type == 'MX' && empty($priority)) continue;
+            if ($forward_used && ($hostname == $sld)) continue;
 
-            if ($forward_used && ($hostname == $sld)) {
-                continue;
-            }
-
-            # Build API Call
-            $apicall = "/api/dnsAddRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrtype=$type&rrhost=$hostname&rrvalue=$address&rrttl=7207";
-            if ($type == 'MX' && !empty($priority)) {
-                $apicall .= "&rrdistance=$priority";
+            if ($recordId && isset($existingById[$recordId])) {
+                # Existing record — track it as submitted
+                $submittedIds[] = $recordId;
+                if ($existingById[$recordId]['type'] === $type) {
+                    # Same type: use dnsUpdateRecord (no wipe, no TTL reset)
+                    $apicall = "/api/dnsUpdateRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrid=" . urlencode($recordId) . "&rrhost=$hostname&rrvalue=$address&rrttl=$ttl";
+                    if ($type == 'MX' && !empty($priority)) {
+                        $apicall .= "&rrdistance=$priority";
+                    }
+                } else {
+                    # Type changed: must delete the old record and add a new one
+                    namesilo_transactionCall("Standard", $apiServerUrl . "/api/dnsDeleteRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrid=" . urlencode($recordId), $params);
+                    $apicall = "/api/dnsAddRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrtype=$type&rrhost=$hostname&rrvalue=$address&rrttl=$ttl";
+                    if ($type == 'MX' && !empty($priority)) {
+                        $apicall .= "&rrdistance=$priority";
+                    }
+                }
+            } else {
+                # New record (no record_id or not found in Namesilo)
+                $apicall = "/api/dnsAddRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrtype=$type&rrhost=$hostname&rrvalue=$address&rrttl=$ttl";
+                if ($type == 'MX' && !empty($priority)) {
+                    $apicall .= "&rrdistance=$priority";
+                }
             }
         }
 
-        # API call to add record
         if (!in_array($apicall, $api_dns_calls)) {
-
             $api_dns_calls[] = $apicall;
-            $values = namesilo_transactionCall("Standard", $apiServerUrl . $apicall, $params);
+            $result = namesilo_transactionCall("Standard", $apiServerUrl . $apicall, $params);
         }
     }
-    # Return Results
-    if (@$value_error_override) {
-        $values['error'] = $value_error_override;
+
+    # Delete only records that were explicitly removed from the form
+    foreach ($existingById as $rid => $rec) {
+        if (!in_array($rid, $submittedIds)) {
+            namesilo_transactionCall("Standard", $apiServerUrl . "/api/dnsDeleteRecord?version=1&type=xml&key=$apiKey&domain=$sld.$tld&rrid=" . urlencode($rid), $params);
+        }
     }
 
-    return $values;
+    if ($value_error_override) {
+        $result['error'] = $value_error_override;
+    }
+
+    return $result;
 }
 
 /*****************************************/
